@@ -1,0 +1,420 @@
+# ☁️ Google Cloud 무료 서버 배포 가이드
+# 미국 주식 테마 종목 봇 — 24시간 운영
+
+## 전체 흐름
+```
+1. GCP 계정 생성 (5분)
+2. VM 인스턴스 생성 (5분)
+3. SSH 접속 & 환경 설정 (10분)
+4. 봇 코드 업로드 (5분)
+5. 봇 실행 & 자동 재시작 설정 (5분)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+총 약 30분
+```
+
+---
+
+## 1단계: GCP 계정 생성
+
+### 1-1. 가입
+1. https://cloud.google.com 접속
+2. "무료로 시작하기" 클릭
+3. Google 계정으로 로그인
+4. **신용카드 등록** (무료 등급 안에선 과금 안 됨)
+5. 첫 90일 $300 크레딧 자동 지급
+
+### 1-2. 프로젝트 생성
+1. 콘솔 상단 프로젝트 선택 → "새 프로젝트"
+2. 이름: `stock-bot` (아무거나)
+3. "만들기" 클릭
+
+---
+
+## 2단계: VM 인스턴스 생성
+
+### 2-1. Compute Engine 활성화
+1. 좌측 메뉴 → Compute Engine → VM 인스턴스
+2. 처음이면 API 활성화 대기 (1~2분)
+
+### 2-2. 인스턴스 만들기
+"인스턴스 만들기" 클릭 후 아래 설정:
+
+```
+이름: stock-bot
+리전: us-central1 (아이오와)  ⚠️ 무료는 미국 리전만!
+영역: us-central1-a
+
+머신 구성:
+  시리즈: E2
+  머신 유형: e2-micro (vCPU 0.25개, 메모리 1GB)
+  ⚠️ 반드시 e2-micro 선택! 다른 건 유료
+
+부팅 디스크:
+  "변경" 클릭
+  운영체제: Ubuntu
+  버전: Ubuntu 22.04 LTS
+  디스크 크기: 20GB (무료 최대 30GB)
+  디스크 유형: 표준 영구 디스크 ⚠️ SSD 아님!
+
+방화벽:
+  ✅ HTTP 트래픽 허용
+  ✅ HTTPS 트래픽 허용
+```
+
+3. "만들기" 클릭 → 1~2분 후 초록색 체크 표시
+
+### 💰 무료 확인 체크리스트
+```
+✅ 리전: us-central1, us-west1, us-east1 중 하나
+✅ 머신: e2-micro
+✅ 디스크: 표준(Standard), 30GB 이하
+✅ 외부IP: 임시(기본값) — 고정IP는 유료이지만 VM에 붙어있으면 무료
+```
+
+---
+
+## 3단계: SSH 접속 & 환경 설정
+
+### 3-1. SSH 접속
+VM 목록에서 "SSH" 버튼 클릭 → 브라우저 터미널 열림
+
+### 3-2. 시스템 업데이트 & Python 설치
+```bash
+# 시스템 업데이트
+sudo apt update && sudo apt upgrade -y
+
+# Python 3.11 설치
+sudo apt install -y python3.11 python3.11-venv python3-pip git
+
+# 기본 python을 3.11로
+sudo update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
+
+# 확인
+python3 --version
+# → Python 3.11.x
+```
+
+### 3-3. 스왑 메모리 설정 (e2-micro는 RAM 1GB라 필요)
+```bash
+sudo fallocate -l 1G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+
+# 영구 적용
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+
+# 확인
+free -h
+# → Swap: 1.0G
+```
+
+### 3-4. 타임존 설정 (한국시간)
+```bash
+sudo timedatectl set-timezone Asia/Seoul
+date
+# → KST 시간 표시
+```
+
+---
+
+## 4단계: 봇 코드 업로드
+
+### 방법 A: Git으로 (추천)
+```bash
+# GitHub에 코드를 올려둔 경우
+cd ~
+git clone https://github.com/YOUR_USERNAME/stock-theme-bot.git
+cd stock-theme-bot
+```
+
+### 방법 B: 직접 업로드
+```bash
+mkdir ~/stock-bot && cd ~/stock-bot
+
+# 각 파일 생성 (nano 에디터)
+nano stock_screener.py       # 코드 붙여넣기 → Ctrl+X → Y → Enter
+nano advanced_screener.py
+nano news_fetcher.py
+nano ai_summarizer.py
+nano telegram_bot_v2.py
+nano performance_tracker.py
+nano market_monitor.py
+nano requirements.txt
+```
+
+### 4-1. 의존성 설치
+```bash
+cd ~/stock-bot  # 또는 ~/stock-theme-bot
+
+# 가상환경 생성
+python3 -m venv venv
+source venv/bin/activate
+
+# 패키지 설치
+pip install --upgrade pip
+pip install -r requirements.txt
+
+# 확인
+python -c "import yfinance; print('yfinance OK')"
+python -c "import telegram; print('telegram OK')"
+```
+
+### 4-2. 환경 변수 설정
+```bash
+# .env 파일 생성
+cat > .env << 'EOF'
+TELEGRAM_BOT_TOKEN=여기에_봇토큰
+TELEGRAM_CHAT_ID=여기에_채팅ID
+ANTHROPIC_API_KEY=sk-ant-여기에_키
+NEWSAPI_KEY=여기에_키
+USE_AI_SUMMARY=false
+EOF
+
+# 환경 변수 로드 스크립트
+cat > load_env.sh << 'EOF'
+#!/bin/bash
+set -a
+source .env
+set +a
+EOF
+chmod +x load_env.sh
+```
+
+### 4-3. 빠른 테스트
+```bash
+source load_env.sh
+
+# 스크리너 테스트
+python advanced_screener.py
+
+# 봇 테스트 (Ctrl+C로 종료)
+python telegram_bot_v2.py
+```
+텔레그램에서 `/start` 보내서 응답 오면 성공!
+
+---
+
+## 5단계: 24시간 자동 실행 (systemd)
+
+### 5-1. 서비스 파일 생성
+```bash
+sudo nano /etc/systemd/system/stock-bot.service
+```
+
+아래 내용 붙여넣기:
+```ini
+[Unit]
+Description=US Stock Theme Bot
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_USERNAME
+WorkingDirectory=/home/YOUR_USERNAME/stock-bot
+Environment=PATH=/home/YOUR_USERNAME/stock-bot/venv/bin:/usr/bin
+EnvironmentFile=/home/YOUR_USERNAME/stock-bot/.env
+ExecStart=/home/YOUR_USERNAME/stock-bot/venv/bin/python telegram_bot_v2.py
+Restart=always
+RestartSec=10
+
+# 메모리 제한 (e2-micro 보호)
+MemoryMax=512M
+MemoryHigh=400M
+
+# 로그
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=stock-bot
+
+[Install]
+WantedBy=multi-user.target
+```
+
+⚠️ `YOUR_USERNAME`을 실제 사용자명으로 변경!
+확인: `whoami` 명령어 실행
+
+### 5-2. 서비스 등록 & 시작
+```bash
+# 서비스 등록
+sudo systemctl daemon-reload
+sudo systemctl enable stock-bot    # 부팅 시 자동 시작
+sudo systemctl start stock-bot     # 지금 시작
+
+# 상태 확인
+sudo systemctl status stock-bot
+# → Active: active (running) 이면 성공!
+```
+
+### 5-3. 로그 확인
+```bash
+# 실시간 로그
+sudo journalctl -u stock-bot -f
+
+# 최근 50줄
+sudo journalctl -u stock-bot -n 50
+
+# 오늘 로그만
+sudo journalctl -u stock-bot --since today
+```
+
+### 5-4. 관리 명령어
+```bash
+sudo systemctl stop stock-bot      # 정지
+sudo systemctl restart stock-bot   # 재시작
+sudo systemctl status stock-bot    # 상태
+```
+
+---
+
+## 6단계: 코드 업데이트 방법
+
+### Git 사용 시
+```bash
+cd ~/stock-bot
+git pull
+sudo systemctl restart stock-bot
+```
+
+### 수동 업데이트
+```bash
+cd ~/stock-bot
+nano advanced_screener.py  # 수정
+sudo systemctl restart stock-bot
+```
+
+---
+
+## 7단계: 모니터링 & 안전장치
+
+### 7-1. 자동 재시작 확인
+이미 systemd에서 `Restart=always` 설정했으므로,
+봇이 크래시해도 10초 후 자동 재시작됩니다.
+
+### 7-2. 디스크 사용량 체크 (SQLite DB 증가 대비)
+```bash
+# 크론잡으로 매주 확인
+crontab -e
+# 아래 줄 추가:
+0 9 * * 1 df -h / | mail -s "Stock Bot Disk Usage" your@email.com
+```
+
+### 7-3. 메모리 모니터링
+```bash
+# 현재 메모리
+free -h
+
+# 봇 메모리 사용량
+ps aux | grep telegram_bot
+```
+
+### 7-4. yfinance 장애 대비
+yfinance가 가끔 막히므로, 봇에 이미 에러 핸들링이 있지만
+장기적으로는 FMP API를 백업으로 추가하면 좋습니다.
+
+---
+
+## 8단계: 보안 (권장)
+
+### 8-1. 방화벽 (필수는 아님, 봇은 아웃바운드만 사용)
+```bash
+# SSH만 허용 (GCP 콘솔에서도 가능)
+sudo ufw allow OpenSSH
+sudo ufw enable
+```
+
+### 8-2. .env 파일 보호
+```bash
+chmod 600 .env  # 소유자만 읽기
+```
+
+### 8-3. 자동 보안 업데이트
+```bash
+sudo apt install unattended-upgrades
+sudo dpkg-reconfigure -plow unattended-upgrades
+```
+
+---
+
+## 💰 비용 요약
+
+| 항목 | 월 비용 |
+|------|---------|
+| e2-micro VM | **$0** (무료 등급) |
+| 30GB 표준 디스크 | **$0** (무료 등급) |
+| 네트워크 (1GB 이하) | **$0** |
+| yfinance | **$0** |
+| 텔레그램 | **$0** |
+| Claude API (선택) | **~$1-3** |
+| **합계** | **$0 ~ $3/월** |
+
+---
+
+## 🔧 트러블슈팅
+
+### 봇이 시작 안 될 때
+```bash
+# 1. 로그 확인
+sudo journalctl -u stock-bot -n 30
+
+# 2. 수동 실행으로 에러 확인
+cd ~/stock-bot
+source venv/bin/activate
+source load_env.sh
+python telegram_bot_v2.py
+```
+
+### "Module not found" 에러
+```bash
+source venv/bin/activate
+pip install -r requirements.txt
+sudo systemctl restart stock-bot
+```
+
+### 메모리 부족 (Killed)
+```bash
+# 스왑 확인
+free -h
+# 스왑이 없으면 3단계의 스왑 설정 다시 실행
+```
+
+### yfinance 데이터 안 나올 때
+```bash
+# 테스트
+python -c "import yfinance as yf; print(yf.download('AAPL', period='1d'))"
+# 빈 결과면 yfinance 업데이트
+pip install --upgrade yfinance
+```
+
+### VM이 멈췄을 때
+GCP 콘솔 → VM 인스턴스 → 정지 → 시작
+(systemd 덕에 봇이 자동으로 다시 올라옴)
+
+---
+
+## ✅ 배포 완료 후 체크리스트
+
+```
+□ 텔레그램에서 /start 응답 확인
+□ /report 리포트 수신 확인
+□ /morning 체크리스트 확인
+□ /check NVDA 분석 확인
+□ "엔비디아 어때?" 자연어 응답 확인
+□ /schedule 7 0 자동 리포트 설정
+□ /position NVDA 130 포지션 등록
+□ systemctl status 녹색 active 확인
+□ 재부팅 후 자동 시작 확인:
+  sudo reboot → 3분 후 텔레그램에서 /start
+```
+
+---
+
+## 🎉 끝!
+
+이제 매일 아침 텔레그램으로:
+- ☀️ 장 시작 전 체크리스트
+- 📊 테마 종목 리포트
+- 🔥 프리마켓/장중 급등락 알림
+- 📢 보유 종목 손절/익절 알림
+
+이 자동으로 옵니다. 문제 있으면 로그부터 확인!
