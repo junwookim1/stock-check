@@ -1,9 +1,11 @@
-# 미국 주식 테마 종목 봇 - 의존성
-yfinance>=0.2.30
-pandas>=2.0.0
-numpy>=1.24.0
-requests>=2.31.0
+# 미국 주식 테마 종목 봇 - 의존성 (Python 3.8 호환)
+yfinance==0.2.40              # 0.2.41+ requires curl_cffi>=0.15 (unavailable on Python 3.8)
+multitasking==0.0.11          # 0.0.12 uses type[X] syntax (Python 3.9+ only)
+pandas>=2.0.0,<2.2        # 2.2+ requires Python 3.9+
+numpy>=1.24.0,<2.0        # 2.0+ requires Python 3.9+
+requests>=2.28.0
 beautifulsoup4>=4.12.0
 python-telegram-bot>=20.7
 anthropic>=0.40.0
-# Python 3.9+ 내장: zoneinfo, sqlite3
+# sqlite3: Python 3.8+ 내장
+# zoneinfo: Python 3.9+ 내장 — Python 3.8에서는 backports.zoneinfo 필요시 추가

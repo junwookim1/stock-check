@@ -13,16 +13,16 @@
 import os
 import logging
 from datetime import datetime, timedelta, time as dtime
-from zoneinfo import ZoneInfo
-
+from typing import List, Dict
+import pytz
 import yfinance as yf
 import pandas as pd
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
-ET = ZoneInfo("America/New_York")
-KST = ZoneInfo("Asia/Seoul")
+ET = pytz.timezone("America/New_York")
+KST = pytz.timezone("Asia/Seoul")
 
 # 모니터링 대상
 WATCHLIST_DEFAULT = [
@@ -94,7 +94,7 @@ def get_market_status() -> dict:
 #  1. 프리마켓/애프터마켓 스캔
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def scan_premarket(symbols: list = None, threshold: float = 3.0) -> list[dict]:
+def scan_premarket(symbols: List = None, threshold: float = 3.0) -> List[dict]:
     """
     프리마켓/애프터마켓 급등락 종목 감지
     threshold: 변동률 기준 (%)
@@ -145,7 +145,7 @@ def scan_premarket(symbols: list = None, threshold: float = 3.0) -> list[dict]:
 #  2. 장중 거래량 폭발 스캔
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def scan_volume_surge(symbols: list = None, rvol_threshold: float = 2.5) -> list[dict]:
+def scan_volume_surge(symbols: List = None, rvol_threshold: float = 2.5) -> List[dict]:
     """장중 거래량 급등 종목 감지"""
     symbols = symbols or WATCHLIST_DEFAULT
     surges = []
@@ -357,7 +357,7 @@ def calculate_fear_greed() -> dict:
 #  5. 손절/익절 모니터
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def check_exit_signals(positions: list[dict]) -> list[dict]:
+def check_exit_signals(positions: List[dict]) -> List[dict]:
     """
     보유 종목 손절/익절 신호 체크
 
