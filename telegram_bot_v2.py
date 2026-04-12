@@ -38,13 +38,12 @@ from telegram.ext import (
 )
 
 from advanced_screener import (
-    screen_stocks_advanced, format_advanced_report, to_json,
+    screen_stocks_advanced, format_advanced_report,
     score_momentum, score_technical, score_volume_breakout,
     score_earnings, score_fundamental, compute_total_score,
     assign_grade, _bar, SECTOR_MAP, UNIVERSE,
 )
 from news_fetcher import get_news_summary
-from ai_summarizer import generate_ai_summary
 from performance_tracker import (
     save_picks, track_returns, get_recent_picks_report,
     format_stats_report, run_backtest,
@@ -56,7 +55,7 @@ from market_monitor import (
     format_market_overview, scan_movers,
 )
 
-import yfinance as yf
+import finnhub_data
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -64,7 +63,6 @@ logger = logging.getLogger(__name__)
 # ── 환경 변수 ──
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-USE_AI = os.getenv("USE_AI_SUMMARY", "false").lower() == "true"
 
 # ── 영구 저장 (간단한 JSON 파일) ──
 DATA_FILE = Path("bot_data.json")
@@ -137,13 +135,9 @@ THEME_ALIASES = {
 def analyze_single(symbol: str) -> str:
     """단일 종목 상세 분석"""
     try:
-        data = yf.download(symbol, period="3mo", progress=False)
+        data = finnhub_data.download_candles(symbol, days=90)
         if data.empty or len(data) < 10:
             return f"❌ {symbol} 데이터를 찾을 수 없습니다."
-
-        # MultiIndex 처리
-        if isinstance(data.columns, __import__('pandas').MultiIndex):
-            data.columns = data.columns.droplevel(1)
 
         m = score_momentum(data)
         t = score_technical(data)
@@ -243,9 +237,6 @@ def generate_report(top_n: int = 5) -> str:
     for s in stocks:
         news_data[s.symbol] = get_news_summary(s.symbol, s.name)
 
-    if USE_AI:
-        return generate_ai_summary(to_json(stocks), news_data)
-
     report = format_advanced_report(stocks)
     news_lines = []
     for s in stocks:
@@ -253,6 +244,144 @@ def generate_report(top_n: int = 5) -> str:
         if headlines:
             news_lines.append(f"\n📰 *{s.symbol}:* {headlines[0]}")
     return report + "\n".join(news_lines)
+
+
+def generate_weekly_report() -> str:
+    """주간 리포트 생성 (주말에도 동작)
+    - 이번 주 지수 / 종목 성과
+    - 테마별 주간 수익률 순위
+    - 다음 주 주목 종목 (멀티팩터 스코어 기준)
+    - 다음 주 실적 발표 일정
+    - 공포탐욕지수
+    """
+    import pytz
+    KST = pytz.timezone("Asia/Seoul")
+    now_kst = datetime.now(KST)
+
+    lines = [
+        f"📅 *주간 리포트* ({now_kst.strftime('%Y년 %m월 %d일')})",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    # ── 1. 주요 지수 주간 성과 (ETF 프록시 사용) ──
+    index_tickers = {"S&P500": "SPY", "NASDAQ": "QQQ", "DOW": "DIA", "VIX": "VIXY"}
+    try:
+        lines.append("\n📊 *주요 지수 주간 성과*")
+        for name, ticker in index_tickers.items():
+            try:
+                df = finnhub_data.download_candles(ticker, days=15)
+                if df.empty or len(df) < 2:
+                    continue
+                lookback = min(5, len(df) - 1)
+                week_chg = (float(df["Close"].iloc[-1]) / float(df["Close"].iloc[-lookback - 1]) - 1) * 100
+                sign = "+" if week_chg > 0 else ""
+                icon = "🟢" if week_chg > 0 else "🔴"
+                lines.append(f"  {icon} {name}: {sign}{week_chg:.1f}%")
+            except Exception:
+                pass
+    except Exception:
+        lines.append("  ⚠️ 지수 데이터 조회 실패")
+
+    # ── 2. 유니버스 주간 수익률 ──
+    weekly_returns = []
+    try:
+        candle_map = finnhub_data.download_bulk(UNIVERSE, days=15)
+        for sym in UNIVERSE:
+            try:
+                df = candle_map.get(sym)
+                if df is None or len(df) < 2:
+                    continue
+                lookback = min(5, len(df) - 1)
+                week_chg = (float(df["Close"].iloc[-1]) / float(df["Close"].iloc[-lookback - 1]) - 1) * 100
+                price = float(df["Close"].iloc[-1])
+                weekly_returns.append((sym, week_chg, price))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    if weekly_returns:
+        weekly_returns.sort(key=lambda x: x[1], reverse=True)
+
+        lines.append("\n🚀 *이번 주 TOP 5 상승*")
+        for sym, chg, price in weekly_returns[:5]:
+            lines.append(f"  🟢 *{sym}* ${price:.2f} (+{chg:.1f}%)")
+
+        lines.append("\n📉 *이번 주 TOP 3 하락*")
+        for sym, chg, price in weekly_returns[-3:]:
+            lines.append(f"  🔴 *{sym}* ${price:.2f} ({chg:.1f}%)")
+
+        # 테마별 주간 성과
+        ret_map = {sym: chg for sym, chg, _ in weekly_returns}
+        sector_perf = []
+        for sector, syms in SECTOR_MAP.items():
+            vals = [ret_map[s] for s in syms if s in ret_map]
+            if vals:
+                sector_perf.append((sector, sum(vals) / len(vals)))
+        sector_perf.sort(key=lambda x: x[1], reverse=True)
+
+        lines.append("\n🎯 *테마별 주간 성과*")
+        for sector, avg in sector_perf:
+            sign = "+" if avg > 0 else ""
+            icon = "🟢" if avg > 1 else "🟡" if avg > -1 else "🔴"
+            lines.append(f"  {icon} {sector}: {sign}{avg:.1f}%")
+
+    # ── 3. 다음 주 주목 종목 ──
+    lines.append("\n━━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("🔮 *다음 주 주목 종목 TOP 5*")
+    lines.append("_(멀티팩터 스코어 기준, 주말 기준 최신 데이터)_")
+    try:
+        picks = screen_stocks_advanced(top_n=5)
+        GRADE_EMOJI = {"S": "🏆", "A": "🔥", "B": "✅", "C": "📌", "D": "⬜"}
+        if picks:
+            for s in picks:
+                lines.append(
+                    f"\n{GRADE_EMOJI.get(s.grade, '')} *{s.symbol}* ({s.name})"
+                    f"\n  ${s.price:.2f} | {s.grade}등급 ({s.total_score:.0f}점)"
+                    f"\n  모멘텀 {s.momentum['score']} | 기술 {s.technical['score']} | 거래량 {s.volume['score']}"
+                )
+                if s.signals:
+                    lines.append(f"  💡 {' | '.join(s.signals[:3])}")
+        else:
+            lines.append("  스크리닝 결과가 없습니다.")
+    except Exception as ex:
+        lines.append(f"  ⚠️ 스크리닝 오류: {str(ex)[:100]}")
+
+    # ── 4. 다음 주 실적 발표 예정 ──
+    lines.append("\n━━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("📆 *다음 주 실적 발표 예정*")
+    try:
+        earnings_list = finnhub_data.get_earnings_upcoming(target_symbols=UNIVERSE, days=10)
+        upcoming = []
+        for entry in earnings_list:
+            sym = entry.get("symbol", "")
+            ed_str = entry.get("date", "")
+            if sym and ed_str:
+                ed = datetime.strptime(ed_str, "%Y-%m-%d")
+                days_left = (ed - datetime.now()).days
+                if 1 <= days_left <= 10:
+                    info = finnhub_data.get_stock_info(sym)
+                    upcoming.append((sym, ed.strftime("%m/%d"), days_left, info.get("shortName", sym)))
+        if upcoming:
+            upcoming.sort(key=lambda x: x[2])
+            for sym, date_str, days_left, name in upcoming[:8]:
+                lines.append(f"  📌 *{sym}* ({name}) — {date_str} ({days_left}일 후)")
+        else:
+            lines.append("  다음 주 실적 발표 일정이 없습니다.")
+    except Exception:
+        lines.append("  다음 주 실적 발표 일정이 없습니다.")
+
+    # ── 5. 공포탐욕지수 ──
+    lines.append("\n━━━━━━━━━━━━━━━━━━━━━━━━━")
+    try:
+        fg = calculate_fear_greed()
+        lines.append(f"{fg['emoji']} *공포탐욕지수: {fg['score']}/100* ({fg['label']})")
+        lines.append(f"💡 {fg['description']}")
+    except Exception:
+        pass
+
+    lines.append("\n_⚠️ 정보 제공 목적이며 투자 권유가 아닙니다_")
+    return "\n".join(lines)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -281,33 +410,56 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = (
         "📖 *사용 가이드*\n\n"
-        "*기본 명령어:*\n"
-        "  /report — 오늘의 테마 종목 (5개)\n"
-        "  /top3 — 빠른 상위 3종목\n"
-        "  /check NVDA — 종목 상세 분석\n"
-        "  /compare NVDA AMD — 종목 비교\n\n"
-        "*테마/섹터:*\n"
-        "  /sector AI — AI 관련주 분석\n"
-        "  /sector 반도체 — 반도체 섹터\n"
-        "  가능: AI, 반도체, 빅테크, EV, 바이오,\n"
-        "  에너지, 방산, 우주, 양자, 크립토, 핀테크 등\n\n"
-        "*관심 종목:*\n"
-        "  /watchlist — 관심 종목 보기\n"
+        "━━ *종목 분석* ━━━━━━━━━━\n"
+        "  /report — 오늘의 추천 종목 TOP 5\n"
+        "  /top3 — 추천 종목 TOP 3 (빠른 버전)\n"
+        "  /weekly — 주간 리포트 (주간 성과 + 다음 주 주목 종목)\n"
+        "  /check NVDA — 특정 종목 멀티팩터 상세 분석\n"
+        "  /compare NVDA AMD — 두 종목 나란히 비교\n\n"
+        "━━ *테마/섹터* ━━━━━━━━━\n"
+        "  /sector AI — 테마별 종목 분석\n"
+        "  가능한 테마: AI · 반도체 · 빅테크 · EV · 바이오\n"
+        "  헬스케어 · 에너지 · 방산 · 우주 · 양자컴퓨팅\n"
+        "  크립토 · 핀테크 · 금융 · 사이버보안 · 클라우드\n\n"
+        "━━ *시장 현황* ━━━━━━━━━\n"
+        "  /market — 시장 전체 현황 (지수 + 급등락)\n"
+        "  /movers — 급등락 종목 스캔 (기본 ±3%)\n"
+        "  /movers 5 — 기준 ±5%로 스캔\n"
+        "  /volume — 거래량 급등 종목 (기본 2배↑)\n"
+        "  /volume 3 — 거래량 3배 이상만\n"
+        "  /premarket — 프리마켓 급등락 스캔\n"
+        "  /morning — 장 시작 전 체크리스트\n"
+        "  /fear — 공포탐욕지수 (Fear & Greed)\n"
+        "  /earnings — 이번 주 실적 발표 일정\n\n"
+        "━━ *포지션 관리* ━━━━━━━\n"
+        "  /position NVDA 130 — 보유 종목 등록 (매수가)\n"
+        "  /positions — 보유 종목 현황 + 손익 + 손절/익절 신호\n"
+        "  /delposition NVDA — 보유 종목 삭제\n\n"
+        "━━ *관심 종목* ━━━━━━━━━\n"
+        "  /watchlist — 관심 종목 현재가 조회\n"
         "  /watch NVDA — 관심 종목 추가\n"
         "  /unwatch NVDA — 관심 종목 제거\n\n"
-        "*알림:*\n"
-        "  /alert NVDA 5 — NVDA가 5% 이상 변동 시 알림\n"
+        "━━ *알림* ━━━━━━━━━━━━━\n"
+        "  /alert NVDA 5 — 5% 이상 변동 시 자동 알림\n"
         "  /alerts — 등록된 알림 목록\n"
-        "  /delalert 1 — 알림 삭제\n\n"
-        "*스케줄:*\n"
-        "  /schedule 7 30 — 매일 오전 7:30에 리포트\n"
+        "  /delalert 1 — 알림 삭제 (번호)\n\n"
+        "━━ *성과 추적* ━━━━━━━━━\n"
+        "  /picks — 최근 7일 추천 종목 성적표\n"
+        "  /picks 30 — 최근 30일 성적표\n"
+        "  /stats — 알고리즘 승률 · 평균 수익률 통계\n"
+        "  /backtest 60 3 — 60거래일 · 3일 보유 백테스트\n\n"
+        "━━ *스케줄* ━━━━━━━━━━━\n"
+        "  /schedule 7 30 — 매일 KST 07:30 자동 리포트\n"
+        "  /schedule — 현재 스케줄 확인\n"
         "  /schedule off — 자동 리포트 중지\n\n"
-        "*실적:*\n"
-        "  /earnings — 이번 주 실적 발표 종목\n\n"
-        "*자연어:*\n"
-        '  "엔비디아 어때?" → NVDA 분석\n'
-        '  "반도체 관련주" → 섹터 분석\n'
-        '  "오늘 뭐 살까" → 리포트\n'
+        "━━ *자연어 지원* ━━━━━━━\n"
+        '  "엔비디아 어때?" → /check NVDA\n'
+        '  "반도체 관련주" → /sector 반도체\n'
+        '  "오늘 뭐 살까" → /report\n'
+        '  "시장 현황" → /market\n'
+        '  "주간 리포트" → /weekly\n'
+        '  "거래량 급등" → /volume\n'
+        '  "급등락 종목" → /movers\n'
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -321,6 +473,12 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_top3(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ 빠른 분석 중...")
     report = generate_report(top_n=3)
+    await _send_long(update, report)
+
+
+async def cmd_weekly(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏳ 주간 리포트 생성 중... (2~3분)")
+    report = generate_weekly_report()
     await _send_long(update, report)
 
 
@@ -344,13 +502,13 @@ async def cmd_compare(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"⏳ {sym1} vs {sym2} 비교 중...")
 
     try:
-        data = yf.download([sym1, sym2], period="3mo", group_by="ticker", progress=False)
+        candle_map = finnhub_data.download_bulk([sym1, sym2], days=90)
         lines = [f"⚔️ *{sym1} vs {sym2} 비교*\n"]
 
         for sym in [sym1, sym2]:
             try:
-                df = data[sym].dropna()
-                if len(df) < 10:
+                df = candle_map.get(sym)
+                if df is None or len(df) < 10:
                     lines.append(f"*{sym}*: 데이터 부족")
                     continue
 
@@ -407,13 +565,13 @@ async def cmd_sector(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"⏳ #{theme} 섹터 {len(symbols)}종목 분석 중...")
 
     try:
-        data = yf.download(symbols, period="3mo", group_by="ticker", progress=False)
+        candle_map = finnhub_data.download_bulk(symbols, days=90)
         results = []
 
         for sym in symbols:
             try:
-                df = data[sym].dropna() if len(symbols) > 1 else data.dropna()
-                if len(df) < 10:
+                df = candle_map.get(sym)
+                if df is None or len(df) < 10:
                     continue
                 m = score_momentum(df)
                 t = score_technical(df)
@@ -456,11 +614,14 @@ async def cmd_watchlist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"⏳ 관심 종목 {len(wl)}개 분석 중...")
 
     try:
-        dl = yf.download(wl, period="1mo", group_by="ticker", progress=False)
+        candle_map = finnhub_data.download_bulk(wl, days=30)
         lines = ["📋 *내 관심 종목*\n"]
         for sym in wl:
             try:
-                df = dl[sym].dropna() if len(wl) > 1 else dl.dropna()
+                df = candle_map.get(sym)
+                if df is None or len(df) < 2:
+                    lines.append(f"⬜ *{sym}* — 데이터 없음")
+                    continue
                 price = float(df["Close"].iloc[-1])
                 chg = round(float((df["Close"].iloc[-1]/df["Close"].iloc[-2]-1)*100), 2)
                 icon = "🟢" if chg > 0 else "🔴"
@@ -569,11 +730,13 @@ async def check_alerts(ctx: ContextTypes.DEFAULT_TYPE):
 
     symbols = list(set(a["symbol"] for a in alerts))
     try:
-        dl = yf.download(symbols, period="5d", group_by="ticker", progress=False)
+        candle_map = finnhub_data.download_bulk(symbols, days=10)
         for a in alerts:
             sym = a["symbol"]
             try:
-                df = dl[sym].dropna() if len(symbols) > 1 else dl.dropna()
+                df = candle_map.get(sym)
+                if df is None or len(df) < 2:
+                    continue
                 price = float(df["Close"].iloc[-1])
                 prev = float(df["Close"].iloc[-2])
                 chg = (price / prev - 1) * 100
@@ -669,18 +832,20 @@ async def cmd_earnings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """이번 주 실적 발표 종목"""
     await update.message.reply_text("⏳ 실적 캘린더 확인 중...")
 
-    upcoming = []
-    for sym in UNIVERSE:
-        try:
-            info = yf.Ticker(sym).info
-            ts = info.get("earningsTimestamp")
-            if ts:
-                ed = datetime.fromtimestamp(ts)
+    try:
+        earnings_list = finnhub_data.get_earnings_upcoming(target_symbols=UNIVERSE, days=7)
+        upcoming = []
+        for entry in earnings_list:
+            sym = entry.get("symbol", "")
+            ed_str = entry.get("date", "")
+            if sym and ed_str:
+                ed = datetime.strptime(ed_str, "%Y-%m-%d")
                 days_left = (ed - datetime.now()).days
                 if 0 <= days_left <= 7:
+                    info = finnhub_data.get_stock_info(sym)
                     upcoming.append((sym, ed.strftime("%m/%d"), days_left, info.get("shortName", sym)))
-        except Exception:
-            continue
+    except Exception:
+        upcoming = []
 
     if not upcoming:
         await update.message.reply_text("📅 이번 주 실적 발표 예정 종목이 없습니다.")
@@ -688,8 +853,8 @@ async def cmd_earnings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     upcoming.sort(key=lambda x: x[2])
     lines = ["📅 *이번 주 실적 발표*\n"]
-    for sym, date, days, name in upcoming:
-        when = "오늘" if days == 0 else f"{days}일 후"
+    for sym, date, days_left, name in upcoming:
+        when = "오늘" if days_left == 0 else f"{days_left}일 후"
         lines.append(f"  📌 *{sym}* ({name}) — {date} ({when})")
 
     lines.append(f"\n/check 종목명 으로 실적 전 분석")
@@ -775,6 +940,86 @@ async def cmd_morning(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _send_long(update, result)
 
 
+async def cmd_volume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/volume [배수] — 거래량 급등 종목 스캔 (기본 2배 이상)"""
+    threshold = 2.0
+    if ctx.args:
+        try:
+            threshold = float(ctx.args[0])
+        except ValueError:
+            pass
+
+    data = load_data()
+    watchlist = data.get("watchlist", [])
+    symbols = watchlist if watchlist else None
+
+    await update.message.reply_text(f"⏳ 거래량 급등 스캔 중... (기준 {threshold}배↑)")
+    surges = scan_volume_surge(symbols=symbols, rvol_threshold=threshold)
+
+    if not surges:
+        await update.message.reply_text(
+            f"📊 현재 거래량 {threshold}배 이상 종목이 없습니다.\n"
+            f"관심 종목 설정 시 해당 목록을 우선 스캔합니다."
+        )
+        return
+
+    lines = [f"🔥 *거래량 급등 종목* (기준 {threshold}배↑)\n"]
+    for s in surges[:10]:
+        icon = "🟢" if s["change_pct"] > 0 else "🔴"
+        sign = "+" if s["change_pct"] > 0 else ""
+        lines.append(
+            f"{icon} *{s['symbol']}* "
+            f"거래량 *{s['rvol']}배* | "
+            f"${s['price']} ({sign}{s['change_pct']}%)"
+        )
+        lines.append(
+            f"   평균 {s['avg_volume']:,} → 현재 {s['volume']:,}"
+        )
+    lines.append(f"\n/check 종목명 으로 상세 분석")
+    await _send_long(update, "\n".join(lines))
+
+
+async def cmd_movers(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/movers [기준%] — 급등락 종목 스캔 (기본 3% 이상)"""
+    threshold = 3.0
+    if ctx.args:
+        try:
+            threshold = float(ctx.args[0])
+        except ValueError:
+            pass
+
+    data = load_data()
+    watchlist = data.get("watchlist", [])
+    symbols = watchlist if watchlist else None
+
+    await update.message.reply_text(f"⏳ 급등락 종목 스캔 중... (기준 ±{threshold}%)")
+    result = scan_movers(symbols=symbols, threshold=threshold)
+
+    gainers = result.get("gainers", [])
+    losers = result.get("losers", [])
+
+    if not gainers and not losers:
+        await update.message.reply_text(
+            f"📊 현재 ±{threshold}% 이상 변동 종목이 없습니다."
+        )
+        return
+
+    lines = [f"📊 *급등락 종목* (기준 ±{threshold}%)\n"]
+
+    if gainers:
+        lines.append("🚀 *급등*")
+        for g in gainers[:8]:
+            lines.append(f"  🟢 *{g['symbol']}* ${g['price']} (+{g['change_pct']}%)")
+
+    if losers:
+        lines.append("\n💥 *급락*")
+        for l in losers[:8]:
+            lines.append(f"  🔴 *{l['symbol']}* ${l['price']} ({l['change_pct']}%)")
+
+    lines.append(f"\n/check 종목명 으로 상세 분석")
+    await _send_long(update, "\n".join(lines))
+
+
 async def cmd_fear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """공포탐욕지수"""
     fg = calculate_fear_greed()
@@ -841,7 +1086,7 @@ async def cmd_positions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     symbols = [p["symbol"] for p in positions]
     try:
-        dl = yf.download(symbols, period="5d", group_by="ticker", progress=False)
+        candle_map = finnhub_data.download_bulk(symbols, days=10)
     except Exception as ex:
         await update.message.reply_text(f"❌ 데이터 로드 실패: {str(ex)[:200]}")
         return
@@ -854,7 +1099,10 @@ async def cmd_positions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         sym = p["symbol"]
         entry = p["entry_price"]
         try:
-            df = dl[sym].dropna() if len(symbols) > 1 else dl.dropna()
+            df = candle_map.get(sym)
+            if df is None or df.empty:
+                lines.append(f"⬜ *{sym}* ${entry} — 가격 조회 실패")
+                continue
             current = float(df["Close"].iloc[-1])
             pnl = (current / entry - 1) * 100
             icon = "📈" if pnl > 0 else "📉"
@@ -980,6 +1228,18 @@ async def job_track_returns(ctx: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Return tracking failed: {e}")
 
 
+async def job_weekly_report(ctx: ContextTypes.DEFAULT_TYPE):
+    """매주 토요일 KST 09:00 자동 주간 리포트"""
+    chat_id = CHAT_ID or load_data().get("chat_id", "")
+    if not chat_id:
+        return
+    try:
+        report = generate_weekly_report()
+        await ctx.bot.send_message(chat_id=chat_id, text=report, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Weekly report failed: {e}")
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  자연어 처리
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -987,6 +1247,18 @@ async def job_track_returns(ctx: ContextTypes.DEFAULT_TYPE):
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """명령어가 아닌 일반 텍스트 처리"""
     text = update.message.text.strip().lower()
+
+    # 거래량 급등 트리거
+    if any(kw in text for kw in ["거래량", "volume", "급등", "폭발", "터진"]):
+        ctx.args = []
+        await cmd_volume(update, ctx)
+        return
+
+    # 급등락 트리거
+    if any(kw in text for kw in ["급락", "movers", "상승", "하락", "등락"]):
+        ctx.args = []
+        await cmd_movers(update, ctx)
+        return
 
     # 시장 현황 트리거
     if any(kw in text for kw in ["시장", "마켓", "지수", "현황"]):
@@ -998,6 +1270,11 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # 성과 트리거
     if any(kw in text for kw in ["성과", "성적", "수익률", "백테스트", "승률"]):
         await cmd_stats(update, ctx)
+        return
+
+    # 주간 리포트 트리거
+    if any(kw in text for kw in ["주간 리포트", "주간리포트", "주말 리포트", "이번 주 어땠", "이번주 어땠", "주간 분석", "주간분석", "weekly"]):
+        await cmd_weekly(update, ctx)
         return
 
     # 리포트 트리거
@@ -1102,6 +1379,7 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("top3", cmd_top3))
+    app.add_handler(CommandHandler("weekly", cmd_weekly))
     app.add_handler(CommandHandler("check", cmd_check))
     app.add_handler(CommandHandler("compare", cmd_compare))
     app.add_handler(CommandHandler("sector", cmd_sector))
@@ -1122,6 +1400,8 @@ def main():
     app.add_handler(CommandHandler("premarket", cmd_premarket))
     app.add_handler(CommandHandler("morning", cmd_morning))
     app.add_handler(CommandHandler("fear", cmd_fear))
+    app.add_handler(CommandHandler("volume", cmd_volume))
+    app.add_handler(CommandHandler("movers", cmd_movers))
     # 신규: 포지션 관리
     app.add_handler(CommandHandler("position", cmd_position))
     app.add_handler(CommandHandler("positions", cmd_positions))
@@ -1147,7 +1427,7 @@ def main():
         jq.run_repeating(check_alerts, interval=1800, first=60)
 
         # 신규: 아침 체크리스트 (KST 21:00 = 프리마켓 시작, UTC 12:00)
-        jq.run_daily(job_morning_checklist, time=dtime(hour=12, minute=0), name="morning_checklist")
+        jq.run_daily(job_morning_checklist, time=time(hour=12, minute=0), name="morning_checklist")
 
         # 신규: 프리마켓 스캔 (15분마다)
         jq.run_repeating(job_premarket_scan, interval=900, first=120)
@@ -1159,9 +1439,17 @@ def main():
         jq.run_repeating(job_exit_monitor, interval=1800, first=240)
 
         # 신규: 수익률 추적 (매일 1회, UTC 23:00 = KST 08:00)
-        jq.run_daily(job_track_returns, time=dtime(hour=23, minute=0), name="track_returns")
+        jq.run_daily(job_track_returns, time=time(hour=23, minute=0), name="track_returns")
 
-        logger.info(f"Scheduled: daily report at KST {h:02d}:{m:02d}, alerts every 30min")
+        # 주간 리포트: 매주 토요일 KST 09:00 (UTC 토요일 00:00)
+        jq.run_daily(
+            job_weekly_report,
+            time=time(hour=0, minute=0),  # UTC 00:00 = KST 09:00
+            days=(5,),                     # 5 = Saturday
+            name="weekly_report",
+        )
+
+        logger.info(f"Scheduled: daily report at KST {h:02d}:{m:02d}, alerts every 30min, weekly report on Saturdays")
 
     print("🚀 Bot is running!")
     print("   명령어: /start, /report, /check, /sector, /help")

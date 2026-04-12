@@ -7,6 +7,8 @@
   3. 거래량   (RVOL, 52주 고가, 돌파)     20%
   4. 실적     (성장률, 실적발표일)         15%
   5. 펀더멘탈 (PER, 시총, 애널리스트)     10%
+
+데이터 소스: Finnhub API (finnhub_data.py)
 """
 
 import logging
@@ -16,7 +18,8 @@ from typing import List, Optional
 import pytz
 import numpy as np
 import pandas as pd
-import yfinance as yf
+
+from finnhub_data import download_bulk, get_stock_info, get_earnings_date
 
 logger = logging.getLogger(__name__)
 
@@ -24,29 +27,40 @@ KST = pytz.timezone("Asia/Seoul")
 
 # ── 스크리닝 유니버스 ──────────────────────────────────
 UNIVERSE = [
-    "NVDA", "AMD", "TSLA", "AAPL", "MSFT", "GOOGL", "AMZN", "META",
-    "PLTR", "SMCI", "ARM", "AVGO", "COIN", "MSTR", "IONQ", "RGTI",
-    "RKLB", "SOFI", "RIVN", "LLY", "NVO", "MRNA", "CRWD", "PANW",
-    "NET", "CRM", "SNOW", "DDOG", "QCOM", "MU", "MRVL", "INTC",
-    "V", "MA", "JPM", "GS", "XOM", "CVX", "LMT", "RTX", "BA",
-    "COST", "WMT", "NFLX", "DIS", "ABBV", "UNH", "TSM", "FSLR", "ENPH",
+    # 빅테크 (5)
+    "AAPL", "MSFT", "GOOGL", "AMZN", "META",
+    # AI / 반도체 (7)
+    "NVDA", "AMD", "AVGO", "ARM", "QCOM", "MU", "TSM",
+    # AI 소프트웨어 / 클라우드 (4)
+    "PLTR", "CRM", "CRWD", "NET",
+    # EV (1)
+    "TSLA",
+    # 바이오 / 헬스케어 (4)
+    "LLY", "NVO", "ABBV", "UNH",
+    # 금융 / 핀테크 (4)
+    "V", "MA", "JPM", "COIN",
+    # 방산 (2)
+    "LMT", "BA",
+    # 에너지 (1)
+    "XOM",
+    # 미디어 / 소비재 (2)
+    "NFLX", "COST",
 ]
 
 SECTOR_MAP = {
-    "AI": ["NVDA", "AMD", "AVGO", "ARM", "SMCI", "PLTR", "CRM", "SNOW"],
-    "반도체": ["NVDA", "AMD", "INTC", "AVGO", "QCOM", "MU", "MRVL", "ARM", "SMCI", "TSM"],
-    "빅테크": ["AAPL", "MSFT", "GOOGL", "AMZN", "META"],
-    "EV": ["TSLA", "RIVN"],
-    "바이오": ["LLY", "NVO", "MRNA", "ABBV"],
-    "헬스케어": ["LLY", "NVO", "UNH", "ABBV"],
-    "에너지": ["XOM", "CVX", "FSLR", "ENPH"],
-    "방산": ["LMT", "RTX", "BA"],
-    "사이버보안": ["CRWD", "PANW", "NET"],
-    "클라우드": ["CRM", "SNOW", "DDOG", "NET"],
-    "크립토": ["COIN", "MSTR"],
-    "핀테크": ["V", "MA", "SOFI", "COIN"],
-    "금융": ["JPM", "GS", "V", "MA"],
-    "양자": ["IONQ", "RGTI"],
+    "AI":      ["NVDA", "AMD", "AVGO", "ARM", "PLTR", "CRM"],
+    "반도체":  ["NVDA", "AMD", "AVGO", "QCOM", "MU", "ARM", "TSM"],
+    "빅테크":  ["AAPL", "MSFT", "GOOGL", "AMZN", "META"],
+    "EV":      ["TSLA"],
+    "바이오":  ["LLY", "NVO", "ABBV"],
+    "헬스케어":["LLY", "NVO", "UNH", "ABBV"],
+    "에너지":  ["XOM"],
+    "방산":    ["LMT", "BA"],
+    "사이버보안": ["CRWD", "NET"],
+    "클라우드":["CRM", "NET"],
+    "크립토":  ["COIN"],
+    "핀테크":  ["V", "MA", "COIN"],
+    "금융":    ["JPM", "V", "MA"],
 }
 
 
@@ -236,7 +250,7 @@ def score_volume_breakout(data: pd.DataFrame) -> dict:
     }
 
 
-def score_earnings(symbol: str, data: pd.DataFrame) -> dict:
+def score_earnings(symbol: str, data: pd.DataFrame, info: Optional[dict] = None) -> dict:
     """실적 성장률 / 발표일 → 0~100"""
     signals = []
     score = 50.0
@@ -244,9 +258,12 @@ def score_earnings(symbol: str, data: pd.DataFrame) -> dict:
     revenue_growth = None
 
     try:
-        info = yf.Ticker(symbol).info
+        if info is None:
+            info = get_stock_info(symbol)
 
         ts = info.get("earningsTimestamp") or info.get("earningsTimestampStart")
+        if not ts:
+            ts = get_earnings_date(symbol)
         if ts:
             ed = datetime.fromtimestamp(ts)
             days_left = (ed - datetime.now()).days
@@ -284,7 +301,7 @@ def score_earnings(symbol: str, data: pd.DataFrame) -> dict:
     }
 
 
-def score_fundamental(symbol: str) -> dict:
+def score_fundamental(symbol: str, info: Optional[dict] = None) -> dict:
     """PER / 시총 / 애널리스트 → 0~100"""
     signals = []
     score = 50.0
@@ -293,7 +310,8 @@ def score_fundamental(symbol: str) -> dict:
     pe_ratio = None
 
     try:
-        info = yf.Ticker(symbol).info
+        if info is None:
+            info = get_stock_info(symbol)
         short_name = info.get("shortName", symbol)
 
         mc = info.get("marketCap") or 0
@@ -357,25 +375,43 @@ def screen_stocks_advanced(
     symbols = universe or UNIVERSE
     results = []
 
-    try:
-        raw = yf.download(symbols, period="3mo", group_by="ticker", progress=False, threads=True)
-    except Exception as ex:
-        logger.error(f"Bulk download failed: {ex}")
+    # ── 1단계: OHLCV 다운로드 (Finnhub candles) ──
+    candle_map = download_bulk(symbols, days=90)
+    if not candle_map:
+        logger.error("No candle data downloaded")
         return []
 
+    # ── 2단계: 가격 데이터만으로 모멘텀·기술·거래량 스코어 계산 ──
+    pre_scored = []
     for sym in symbols:
         try:
-            df = raw[sym].dropna() if len(symbols) > 1 else raw.dropna()
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.droplevel(1)
-            if len(df) < 15:
+            df = candle_map.get(sym)
+            if df is None or len(df) < 15:
                 continue
-
             m = score_momentum(df)
             t = score_technical(df)
             v = score_volume_breakout(df)
-            e = score_earnings(sym, df)
-            f = score_fundamental(sym)
+            pre_scored.append((sym, df, m, t, v))
+        except Exception as ex:
+            logger.debug(f"Pre-score {sym}: {ex}")
+
+    # ── 3단계: 상위 후보만 펀더멘탈 조회 (API 절약) ──
+    pre_scored.sort(
+        key=lambda x: x[2]["score"] * 0.30 + x[3]["score"] * 0.25 + x[4]["score"] * 0.20,
+        reverse=True,
+    )
+    candidates = pre_scored[:max(top_n * 4, 20)]
+
+    logger.info(f"Fetching fundamentals for {len(candidates)} candidates...")
+    info_map = {}
+    for sym, _df, _m, _t, _v in candidates:
+        info_map[sym] = get_stock_info(sym)
+
+    for sym, df, m, t, v in candidates:
+        try:
+            cached_info = info_map.get(sym)
+            e = score_earnings(sym, df, info=cached_info)
+            f = score_fundamental(sym, info=cached_info)
             total = compute_total_score(m, t, v, e, f)
             grade = assign_grade(total)
 

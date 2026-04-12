@@ -12,7 +12,7 @@ fi
 cd "$SCRIPT_DIR"
 set -a && source .env && set +a
 
-nohup python3 telegram_bot_v2.py >> "$LOG_FILE" 2>&1 &
+nohup "$SCRIPT_DIR/venv/bin/python3" telegram_bot_v2.py >> "$LOG_FILE" 2>&1 &
 echo $! > "$PID_FILE"
 echo "봇 시작됨 (PID: $!)"
 echo "로그: tail -f $LOG_FILE"

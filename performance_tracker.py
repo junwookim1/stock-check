@@ -15,9 +15,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import logging
 
-import yfinance as yf
 import pandas as pd
 import numpy as np
+import finnhub_data
 
 logger = logging.getLogger(__name__)
 
@@ -175,12 +175,11 @@ def track_returns():
     symbols = list(set(r[2] for r in rows))
     logger.info(f"Tracking returns for {len(rows)} picks ({len(symbols)} symbols)")
 
-    # 가격 데이터 한번에 다운로드
+    # 가격 데이터 한번에 다운로드 — earliest_date부터 오늘까지 필요한 일수 계산
     earliest_date = min(r[1] for r in rows)
+    days_needed = (datetime.now() - datetime.strptime(earliest_date, "%Y-%m-%d")).days + 15
     try:
-        price_data = yf.download(
-            symbols, start=earliest_date, progress=False, group_by="ticker"
-        )
+        price_data = finnhub_data.download_bulk(symbols, days=days_needed)
     except Exception as e:
         logger.error(f"Price download failed: {e}")
         conn.close()
@@ -189,13 +188,8 @@ def track_returns():
     updated = 0
     for row_id, pick_date, symbol, pick_price in rows:
         try:
-            if len(symbols) == 1:
-                df = price_data
-            else:
-                df = price_data[symbol]
-
-            df = df.dropna()
-            if df.empty or pick_price <= 0:
+            df = price_data.get(symbol)
+            if df is None or df.empty or pick_price <= 0:
                 continue
 
             # 추천일 이후의 날짜들 찾기
@@ -477,12 +471,12 @@ def run_backtest(lookback_days: int = 60, hold_days: int = 3, top_n: int = 5) ->
     # 넉넉히 데이터 가져오기
     total_days = lookback_days + hold_days + 70  # RSI 등 초기값 필요
     try:
-        all_data = yf.download(
-            UNIVERSE, period=f"{total_days}d",
-            group_by="ticker", progress=False
-        )
+        all_data = finnhub_data.download_bulk(UNIVERSE, days=total_days)
     except Exception as e:
         return f"❌ 백테스트 데이터 다운로드 실패: {e}"
+
+    if not all_data:
+        return "❌ 백테스트 데이터를 가져올 수 없습니다."
 
     # 매일 시뮬레이션
     results = []
@@ -495,10 +489,10 @@ def run_backtest(lookback_days: int = 60, hold_days: int = 3, top_n: int = 5) ->
         day_picks = []
         for sym in UNIVERSE:
             try:
-                if len(UNIVERSE) > 1:
-                    df = all_data[sym].dropna()
-                else:
-                    df = all_data.dropna()
+                df = all_data.get(sym)
+                if df is None:
+                    continue
+                df = df.dropna()
 
                 # sim_date까지의 데이터만 사용 (미래 정보 배제)
                 df_past = df[df.index <= sim_date]

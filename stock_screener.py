@@ -4,12 +4,12 @@
 - 실적 데이터 포함
 """
 
-import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import json
 import logging
+import finnhub_data
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -58,32 +58,11 @@ SECTOR_MAP = {
 }
 
 
-def fetch_stock_data(symbols: list[str], period: str = "1mo") -> dict:
-    """yfinance로 주가/거래량 데이터 수집"""
+def fetch_stock_data(symbols: list, period: str = "1mo") -> dict:
+    """Finnhub로 주가/거래량 데이터 수집"""
     logger.info(f"Fetching data for {len(symbols)} symbols...")
-    result = {}
-    # 배치로 다운로드 (속도 향상)
-    try:
-        data = yf.download(symbols, period=period, group_by="ticker", progress=False, threads=True)
-    except Exception as e:
-        logger.error(f"Batch download failed: {e}")
-        return result
-
-    for sym in symbols:
-        try:
-            if len(symbols) == 1:
-                df = data
-            else:
-                df = data[sym]
-            df = df.dropna()
-            if len(df) < 5:
-                continue
-            result[sym] = df
-        except Exception:
-            continue
-
-    logger.info(f"Successfully fetched {len(result)} symbols")
-    return result
+    days = 30 if "1mo" in period else 90
+    return finnhub_data.download_bulk(symbols, days=days)
 
 
 def analyze_volume_spike(df: pd.DataFrame, window: int = 20) -> dict:
@@ -124,8 +103,7 @@ def analyze_price_move(df: pd.DataFrame) -> dict:
 def get_fundamentals(symbol: str) -> dict:
     """기본 펀더멘탈 데이터"""
     try:
-        ticker = yf.Ticker(symbol)
-        info = ticker.info
+        info = finnhub_data.get_stock_info(symbol)
         return {
             "market_cap": info.get("marketCap", 0),
             "market_cap_str": _format_market_cap(info.get("marketCap", 0)),
@@ -134,7 +112,7 @@ def get_fundamentals(symbol: str) -> dict:
             "eps": info.get("trailingEps", 0),
             "revenue_growth": info.get("revenueGrowth", 0),
             "earnings_date": _get_earnings_date(info),
-            "sector": info.get("sector", ""),
+            "sector": info.get("industry", ""),
             "short_name": info.get("shortName", symbol),
         }
     except Exception as e:
@@ -220,7 +198,7 @@ def calculate_score(volume_data: dict, price_data: dict, fundamentals: dict) -> 
     return round(score, 1)
 
 
-def screen_stocks(top_n: int = 5) -> list[dict]:
+def screen_stocks(top_n: int = 5) -> list:
     """
     메인 스크리닝 함수
     Returns: 상위 N개 종목의 분석 결과 리스트
@@ -272,7 +250,7 @@ def screen_stocks(top_n: int = 5) -> list[dict]:
     return top
 
 
-def format_report(stocks: list[dict]) -> str:
+def format_report(stocks: list) -> str:
     """텔레그램 전송용 리포트 포맷 (Markdown)"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     lines = [

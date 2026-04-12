@@ -15,7 +15,7 @@ import logging
 from datetime import datetime, timedelta, time as dtime
 from typing import List, Dict
 import pytz
-import yfinance as yf
+import finnhub_data
 import pandas as pd
 import numpy as np
 
@@ -31,17 +31,13 @@ WATCHLIST_DEFAULT = [
     "IONQ", "RGTI", "RKLB", "SOFI", "RIVN",
 ]
 
-# 주요 지수/ETF
+# 주요 지수/ETF (Finnhub에서 조회 가능한 심볼만 사용)
 INDICES = {
-    "^GSPC": "S&P 500",
-    "^IXIC": "나스닥",
-    "^DJI": "다우",
-    "^VIX": "VIX(공포지수)",
-    "^TNX": "미국10년물",
-    "GC=F": "금",
-    "CL=F": "원유(WTI)",
-    "BTC-USD": "비트코인",
-    "KRW=X": "원/달러",
+    "SPY": "S&P 500",
+    "QQQ": "나스닥100",
+    "DIA": "다우",
+    "GLD": "금 ETF",
+    "USO": "원유 ETF",
 }
 
 INDEX_ETFS = {
@@ -98,40 +94,35 @@ def scan_premarket(symbols: List = None, threshold: float = 3.0) -> List[dict]:
     """
     프리마켓/애프터마켓 급등락 종목 감지
     threshold: 변동률 기준 (%)
+    Note: Finnhub free tier에서는 프리마켓 가격이 제공되지 않으므로
+    현재 시세(regularMarketPrice)와 전일 종가를 비교합니다.
     """
     symbols = symbols or WATCHLIST_DEFAULT
     movers = []
 
     for sym in symbols:
         try:
-            ticker = yf.Ticker(sym)
-            # 최근 2일 데이터 (1분봉으로 프리마켓 포함)
-            df = ticker.history(period="2d", interval="1m", prepost=True)
-            if df.empty:
+            quote = finnhub_data.get_quote(sym)
+            if not quote:
                 continue
 
-            info = ticker.info
-            prev_close = info.get("previousClose") or info.get("regularMarketPreviousClose", 0)
-            current = info.get("regularMarketPrice") or info.get("currentPrice", 0)
-            pre_price = info.get("preMarketPrice", 0)
-            post_price = info.get("postMarketPrice", 0)
-
-            # 프리마켓 또는 애프터마켓 가격 사용
-            active_price = pre_price or post_price or current
-            if not active_price or not prev_close:
+            current = quote.get("regularMarketPrice", 0)
+            prev_close = quote.get("previousClose", 0)
+            if not current or not prev_close:
                 continue
 
-            change_pct = (active_price / prev_close - 1) * 100
+            change_pct = (current / prev_close - 1) * 100
 
             if abs(change_pct) >= threshold:
+                info = finnhub_data.get_stock_info(sym)
                 movers.append({
                     "symbol": sym,
                     "name": info.get("shortName", sym),
                     "prev_close": round(prev_close, 2),
-                    "current_price": round(active_price, 2),
+                    "current_price": round(current, 2),
                     "change_pct": round(change_pct, 2),
-                    "source": "premarket" if pre_price else "aftermarket" if post_price else "regular",
-                    "volume": info.get("volume", 0),
+                    "source": "regular",
+                    "volume": 0,
                 })
 
         except Exception as e:
@@ -150,15 +141,12 @@ def scan_volume_surge(symbols: List = None, rvol_threshold: float = 2.5) -> List
     symbols = symbols or WATCHLIST_DEFAULT
     surges = []
 
-    try:
-        data = yf.download(symbols, period="1mo", progress=False, group_by="ticker")
-    except Exception:
-        return []
+    candle_map = finnhub_data.download_bulk(symbols, days=30)
 
     for sym in symbols:
         try:
-            df = data[sym].dropna() if len(symbols) > 1 else data.dropna()
-            if len(df) < 10:
+            df = candle_map.get(sym)
+            if df is None or len(df) < 10:
                 continue
 
             avg_vol = float(df["Volume"].iloc[-21:-1].mean()) if len(df) > 21 else float(df["Volume"].iloc[:-1].mean())
@@ -203,22 +191,15 @@ def morning_checklist(watchlist: list = None) -> str:
     lines.append("━━ *주요 지수* ━━━━━━━")
     for sym, name in INDICES.items():
         try:
-            t = yf.Ticker(sym)
-            info = t.info
-            price = info.get("regularMarketPrice", 0) or info.get("previousClose", 0)
-            prev = info.get("regularMarketPreviousClose") or info.get("previousClose", 0)
+            quote = finnhub_data.get_quote(sym)
+            if not quote:
+                continue
+            price = quote.get("regularMarketPrice", 0)
+            prev = quote.get("previousClose", 0)
             if price and prev:
                 chg = (price / prev - 1) * 100
                 icon = "🟢" if chg > 0 else "🔴" if chg < 0 else "⚪"
-
-                if sym == "^VIX":
-                    # VIX는 절대값이 중요
-                    fear = "😰공포" if price > 25 else "😟불안" if price > 20 else "😐보통" if price > 15 else "😊안정"
-                    lines.append(f"  {icon} {name}: {price:.1f} ({'+' if chg>0 else ''}{chg:.1f}%) {fear}")
-                elif sym == "KRW=X":
-                    lines.append(f"  {icon} {name}: ₩{price:.0f} ({'+' if chg>0 else ''}{chg:.1f}%)")
-                else:
-                    lines.append(f"  {icon} {name}: {price:,.1f} ({'+' if chg>0 else ''}{chg:.1f}%)")
+                lines.append(f"  {icon} {name}: {price:,.1f} ({'+' if chg>0 else ''}{chg:.1f}%)")
         except Exception:
             continue
 
@@ -259,29 +240,34 @@ def morning_checklist(watchlist: list = None) -> str:
 def calculate_fear_greed() -> dict:
     """
     간이 공포탐욕 지수 (CNN Fear & Greed 방식 간소화)
-    지표: VIX, 시장 모멘텀, 거래량, 52주 신고/신저 비율
+    지표: VIX(VIXY 프록시), 시장 모멘텀(SPY), 거래량(SPY), 나스닥 RSI(QQQ)
     """
     signals = []
 
-    # 1) VIX (공포지수)
+    # 1) VIX 프록시 (VIXY ETF — Finnhub에서 ^VIX 직접 조회 불가)
     try:
-        vix = yf.Ticker("^VIX").info.get("regularMarketPrice", 20)
-        if vix < 15:
-            signals.append(80)  # 극도의 탐욕
-        elif vix < 20:
-            signals.append(60)
-        elif vix < 25:
-            signals.append(40)
-        elif vix < 30:
-            signals.append(25)
+        vixy = finnhub_data.download_candles("VIXY", days=10)
+        if not vixy.empty:
+            vixy_price = float(vixy["Close"].iloc[-1])
+            # VIXY는 VIX와 비례 관계 — 대략적 변환
+            if vixy_price < 12:
+                signals.append(80)
+            elif vixy_price < 16:
+                signals.append(60)
+            elif vixy_price < 22:
+                signals.append(40)
+            elif vixy_price < 30:
+                signals.append(25)
+            else:
+                signals.append(10)
         else:
-            signals.append(10)  # 극도의 공포
+            signals.append(50)
     except Exception:
         signals.append(50)
 
-    # 2) S&P 500 모멘텀 (vs 125일 이평)
+    # 2) S&P 500 모멘텀 — SPY 프록시 (vs 125일 이평)
     try:
-        sp = yf.download("^GSPC", period="6mo", progress=False)
+        sp = finnhub_data.download_candles("SPY", days=180)
         if len(sp) > 125:
             current = float(sp["Close"].iloc[-1])
             ma125 = float(sp["Close"].iloc[-125:].mean())
@@ -301,13 +287,13 @@ def calculate_fear_greed() -> dict:
 
     # 3) 시장 거래량 (SPY)
     try:
-        spy = yf.download("SPY", period="1mo", progress=False)
+        spy = finnhub_data.download_candles("SPY", days=30)
         if len(spy) > 10:
             avg_vol = float(spy["Volume"].iloc[-11:-1].mean())
             last_vol = float(spy["Volume"].iloc[-1])
             vol_ratio = last_vol / avg_vol if avg_vol > 0 else 1
             if vol_ratio > 1.5:
-                signals.append(35)  # 패닉 매도 or 광란 매수
+                signals.append(35)
             elif vol_ratio > 1.2:
                 signals.append(55)
             else:
@@ -315,9 +301,9 @@ def calculate_fear_greed() -> dict:
     except Exception:
         signals.append(50)
 
-    # 4) 나스닥 RSI
+    # 4) 나스닥 RSI (QQQ)
     try:
-        qqq = yf.download("QQQ", period="1mo", progress=False)
+        qqq = finnhub_data.download_candles("QQQ", days=30)
         if len(qqq) > 14:
             delta = qqq["Close"].diff()
             gain = delta.where(delta > 0, 0).ewm(alpha=1/14, min_periods=14).mean()
@@ -326,7 +312,7 @@ def calculate_fear_greed() -> dict:
             rsi = float(100 - (100 / (1 + rs.iloc[-1])))
 
             if rsi > 70:
-                signals.append(85)  # 탐욕
+                signals.append(85)
             elif rsi > 55:
                 signals.append(65)
             elif rsi > 45:
@@ -334,7 +320,7 @@ def calculate_fear_greed() -> dict:
             elif rsi > 30:
                 signals.append(30)
             else:
-                signals.append(15)  # 공포
+                signals.append(15)
     except Exception:
         signals.append(50)
 
@@ -371,13 +357,9 @@ def check_exit_signals(positions: List[dict]) -> List[dict]:
         sym = pos["symbol"]
         entry = pos["entry_price"]
         try:
-            df = yf.download(sym, period="1mo", progress=False)
+            df = finnhub_data.download_candles(sym, days=30)
             if df.empty:
                 continue
-
-            # MultiIndex 처리
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.droplevel(1)
 
             current = float(df["Close"].iloc[-1])
             pnl_pct = (current / entry - 1) * 100
@@ -466,15 +448,12 @@ def scan_movers(symbols: list = None, threshold: float = 4.0) -> dict:
     gainers = []
     losers = []
 
-    try:
-        data = yf.download(symbols, period="5d", group_by="ticker", progress=False)
-    except Exception:
-        return {"gainers": [], "losers": []}
+    candle_map = finnhub_data.download_bulk(symbols, days=10)
 
     for sym in symbols:
         try:
-            df = data[sym].dropna() if len(symbols) > 1 else data.dropna()
-            if len(df) < 2:
+            df = candle_map.get(sym)
+            if df is None or len(df) < 2:
                 continue
             price = float(df["Close"].iloc[-1])
             prev = float(df["Close"].iloc[-2])
@@ -578,18 +557,15 @@ def format_market_overview() -> str:
     # 주요 지수
     for sym, name in list(INDICES.items())[:6]:
         try:
-            info = yf.Ticker(sym).info
-            price = info.get("regularMarketPrice", 0) or info.get("previousClose", 0)
-            prev = info.get("regularMarketPreviousClose", 0) or info.get("previousClose", 0)
+            quote = finnhub_data.get_quote(sym)
+            if not quote:
+                continue
+            price = quote.get("regularMarketPrice", 0)
+            prev = quote.get("previousClose", 0)
             if price and prev:
                 chg = (price / prev - 1) * 100
                 icon = "🟢" if chg > 0 else "🔴" if chg < 0 else "⚪"
-                if "KRW" in sym:
-                    lines.append(f"  {icon} {name}: ₩{price:.0f} ({'+' if chg>0 else ''}{chg:.1f}%)")
-                elif "BTC" in sym:
-                    lines.append(f"  {icon} {name}: ${price:,.0f} ({'+' if chg>0 else ''}{chg:.1f}%)")
-                else:
-                    lines.append(f"  {icon} {name}: {price:,.1f} ({'+' if chg>0 else ''}{chg:.1f}%)")
+                lines.append(f"  {icon} {name}: {price:,.1f} ({'+' if chg>0 else ''}{chg:.1f}%)")
         except Exception:
             continue
 
