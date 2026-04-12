@@ -314,6 +314,41 @@ def get_earnings_upcoming(target_symbols: List[str] = None, days: int = 14) -> l
     return entries
 
 
+def get_yf_meta(symbol: str) -> dict:
+    """Yahoo Finance v8 chart meta 조회 (임의 심볼, API키 불필요)
+    한국 주식(.KS/.KQ), ETF, 지수(^KS11) 등 모든 심볼 지원
+    """
+    cache_key = f"yf_meta:{symbol}"
+    cached = _cache_get(cache_key, ttl=300)
+    if cached:
+        return cached
+    try:
+        r = requests.get(
+            f"{_YF_BASE}/{symbol}",
+            headers=_YF_HEADERS,
+            params={"interval": "1d", "range": "5d"},
+            timeout=10,
+        )
+        if r.status_code == 200 and r.content:
+            result = r.json().get("chart", {}).get("result")
+            if not result:
+                return {}
+            meta = result[0]["meta"]
+            return _cache_set(cache_key, {
+                "shortName": meta.get("shortName", symbol),
+                "currency": meta.get("currency", "USD"),
+                "regularMarketPrice": meta.get("regularMarketPrice"),
+                "previousClose": meta.get("previousClose") or meta.get("chartPreviousClose"),
+                "52WeekHigh": meta.get("fiftyTwoWeekHigh"),
+                "52WeekLow": meta.get("fiftyTwoWeekLow"),
+                "marketCap": meta.get("marketCap", 0),
+                "exchangeName": meta.get("exchangeName", ""),
+            })
+    except Exception as ex:
+        logger.error(f"get_yf_meta error ({symbol}): {ex}")
+    return {}
+
+
 def get_earnings_date(symbol: str) -> Optional[int]:
     """특정 종목의 다음 실적 발표일 → Unix timestamp (없으면 None)"""
     from_str = datetime.now().strftime("%Y-%m-%d")

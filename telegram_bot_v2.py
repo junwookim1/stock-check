@@ -57,6 +57,11 @@ from market_monitor import (
 
 import finnhub_data
 from leveraged_etf import screen_letf, format_letf_report, get_letf_summary, LETF_UNIVERSE
+from korean_screener import (
+    screen_kr_stocks, analyze_single_kr, format_kr_report,
+    get_kr_market_status, get_kr_index_status, format_kr_market,
+    KR_ALIASES, KR_SECTOR_MAP, resolve_kr_symbol, resolve_kr_sector,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -432,6 +437,16 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "  /morning — 장 시작 전 체크리스트\n"
         "  /fear — 공포탐욕지수 (Fear & Greed)\n"
         "  /earnings — 이번 주 실적 발표 일정\n\n"
+        "━━ *한국 주식 (KR)* ━━━━━\n"
+        "  /kreport — 한국 주식 멀티팩터 TOP 5\n"
+        "  /krtop3 — 한국 주식 TOP 3 (빠른)\n"
+        "  /krcheck 삼성전자 — 한국 종목 상세 분석\n"
+        "  /krcheck 005930 — 종목코드로 분석\n"
+        "  /krsector 반도체 — 섹터별 분석\n"
+        "  /krmarket — KOSPI/KOSDAQ 현황\n"
+        "  /krcompare 삼성전자 하이닉스 — 종목 비교\n"
+        "  가능 섹터: 반도체·2차전지·자동차·인터넷\n"
+        "  바이오·금융·엔터·게임·방산·로봇/AI\n\n"
         "━━ *레버리지 ETF* ━━━━━━\n"
         "  /letf — Bull 3x ETF 추천 TOP 5\n"
         "  /letf bear — Bear(인버스) ETF TOP 5\n"
@@ -471,6 +486,9 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         '  "급등락 종목" → /movers\n'
         '  "레버리지 etf" → /letf\n'
         '  "인버스 etf" → /letf bear\n'
+        '  "코스피 어때" → /krmarket\n'
+        '  "삼성전자 어때" → /krcheck 삼성전자\n'
+        '  "한국 주식 추천" → /kreport\n'
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -1042,6 +1060,171 @@ async def cmd_fear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  한국 주식 명령어
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async def cmd_kreport(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/kreport — 한국 주식 멀티팩터 TOP 5"""
+    await update.message.reply_text("⏳ 한국 주식 분석 중... (1~2분)")
+    results = screen_kr_stocks(top_n=5)
+    report = format_kr_report(results)
+    await _send_long(update, report)
+
+
+async def cmd_krtop3(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/krtop3 — 한국 주식 TOP 3 (빠른 버전)"""
+    await update.message.reply_text("⏳ 빠른 분석 중...")
+    results = screen_kr_stocks(top_n=3)
+    report = format_kr_report(results)
+    await _send_long(update, report)
+
+
+async def cmd_krcheck(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/krcheck 삼성전자 또는 /krcheck 005930"""
+    if not ctx.args:
+        await update.message.reply_text(
+            "사용법: /krcheck 삼성전자\n"
+            "또는:  /krcheck 005930\n"
+            "또는:  /krcheck 005930.KS"
+        )
+        return
+    query = " ".join(ctx.args)
+    sym = resolve_kr_symbol(query)
+    display = sym or query
+    await update.message.reply_text(f"⏳ {display} 분석 중...")
+    result = analyze_single_kr(query)
+    await _send_long(update, result)
+
+
+async def cmd_krsector(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/krsector 반도체 — 한국 섹터별 분석"""
+    if not ctx.args:
+        available = " · ".join(sorted(KR_SECTOR_MAP.keys()))
+        await update.message.reply_text(
+            f"사용법: /krsector 반도체\n\n가능한 섹터:\n{available}"
+        )
+        return
+
+    sector_raw = " ".join(ctx.args)
+    resolved = resolve_kr_sector(sector_raw)
+    if not resolved or resolved not in KR_SECTOR_MAP:
+        available = " · ".join(sorted(KR_SECTOR_MAP.keys()))
+        await update.message.reply_text(
+            f"❌ '{sector_raw}' 섹터를 찾을 수 없습니다.\n\n가능한 섹터:\n{available}"
+        )
+        return
+
+    syms = KR_SECTOR_MAP[resolved]
+    await update.message.reply_text(f"⏳ #{resolved} 섹터 {len(syms)}종목 분석 중...")
+
+    try:
+        candle_map = finnhub_data.download_bulk(syms, days=90)
+        rows = []
+        for sym in syms:
+            df = candle_map.get(sym)
+            if df is None or len(df) < 10:
+                continue
+            from korean_screener import _kr_score
+            m = score_momentum(df)
+            t = score_technical(df)
+            v = score_volume_breakout(df)
+            total = _kr_score(m, t, v)
+            price = float(df["Close"].iloc[-1])
+            chg = round(float((df["Close"].iloc[-1] / df["Close"].iloc[-2] - 1) * 100), 2)
+            from korean_screener import KR_UNIVERSE as _KRU
+            name = _KRU.get(sym, {}).get("name", sym)
+            rows.append((sym, name, total, price, chg, m["ret_1m"], v["rvol"]))
+
+        rows.sort(key=lambda x: x[2], reverse=True)
+        lines = [f"🇰🇷 *#{resolved} 섹터 분석*\n"]
+        for sym, name, score, price, chg, ret1m, rvol in rows:
+            icon = "🟢" if chg > 0 else "🔴"
+            sign = "+" if chg > 0 else ""
+            grade = assign_grade(score)
+            market_tag = "KS" if sym.endswith(".KS") else "KQ"
+            lines.append(f"{icon} *{name}* [{market_tag}]")
+            lines.append(
+                f"   ₩{price:,.0f} ({sign}{chg}%) | {score:.0f}점({grade})"
+                f" | 1M {'+' if ret1m>0 else ''}{ret1m:.1f}% | RVOL {rvol:.1f}x"
+            )
+        lines.append(f"\n_총 {len(rows)}종목 분석 완료_")
+        await _send_long(update, "\n".join(lines))
+
+    except Exception as ex:
+        await update.message.reply_text(f"❌ 섹터 분석 실패: {str(ex)[:200]}")
+
+
+async def cmd_krmarket(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/krmarket — KOSPI/KOSDAQ 현황 + 장 상태"""
+    await update.message.reply_text("⏳ 한국 시장 현황 확인 중...")
+    status = get_kr_market_status()
+    index_data = get_kr_index_status()
+
+    report = format_kr_market(index_data, status)
+
+    # 장중이면 상위 5종목 추가
+    if status["is_open"]:
+        try:
+            results = screen_kr_stocks(top_n=3)
+            if results:
+                report += "\n\n" + format_kr_report(results)
+        except Exception:
+            pass
+
+    await _send_long(update, report)
+
+
+async def cmd_krcompare(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/krcompare 삼성전자 SK하이닉스 — 두 한국 종목 비교"""
+    if len(ctx.args) < 2:
+        await update.message.reply_text("사용법: /krcompare 삼성전자 SK하이닉스")
+        return
+
+    q1 = ctx.args[0]
+    q2 = ctx.args[1]
+    sym1 = resolve_kr_symbol(q1) or q1.upper()
+    sym2 = resolve_kr_symbol(q2) or q2.upper()
+
+    await update.message.reply_text(f"⏳ {sym1} vs {sym2} 비교 중...")
+
+    try:
+        candle_map = finnhub_data.download_bulk([sym1, sym2], days=90)
+        from korean_screener import KR_UNIVERSE as _KRU, _kr_score
+        lines = [f"⚔️ *{_KRU.get(sym1,{}).get('name',sym1)} vs {_KRU.get(sym2,{}).get('name',sym2)}*\n"]
+
+        for sym in [sym1, sym2]:
+            df = candle_map.get(sym)
+            name = _KRU.get(sym, {}).get("name", sym)
+            market_tag = "KS" if sym.endswith(".KS") else "KQ"
+            if df is None or len(df) < 10:
+                lines.append(f"*{name}* [{market_tag}]: 데이터 부족")
+                continue
+            m = score_momentum(df)
+            t = score_technical(df)
+            v = score_volume_breakout(df)
+            total = _kr_score(m, t, v)
+            grade = assign_grade(total)
+            price = float(df["Close"].iloc[-1])
+            chg = round(float((price / float(df["Close"].iloc[-2]) - 1) * 100), 2)
+            sign = "+" if chg > 0 else ""
+            icon = "🟢" if chg > 0 else "🔴"
+
+            lines.append(f"{'─' * 25}")
+            lines.append(f"*{name}* [{market_tag}] ({sym})")
+            lines.append(f"  {icon} ₩{price:,.0f} ({sign}{chg}%)")
+            lines.append(f"  🏆 등급: *{grade}* ({total}/100)")
+            lines.append(f"  모멘텀: {m['score']} | 기술: {t['score']} | 거래량: {v['score']}")
+            lines.append(f"  1M {'+' if m['ret_1m']>0 else ''}{m['ret_1m']}% | RSI {t['rsi']:.0f} | RVOL {v['rvol']}x")
+            lines.append("")
+
+        lines.append("_⚠️ 정보 제공 목적이며 투자 권유가 아닙니다_")
+        await _send_long(update, "\n".join(lines))
+
+    except Exception as ex:
+        await update.message.reply_text(f"❌ 비교 실패: {str(ex)[:200]}")
+
+
 async def cmd_letf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/letf [bull|bear|all] [섹터] [n] — 레버리지 ETF 추천
 
@@ -1315,6 +1498,30 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """명령어가 아닌 일반 텍스트 처리"""
     text = update.message.text.strip().lower()
 
+    # 한국 시장 현황 트리거
+    if any(kw in text for kw in ["코스피", "코스닥", "국장", "한국 시장", "한국시장"]):
+        await cmd_krmarket(update, ctx)
+        return
+
+    # 한국 주식 리포트 트리거
+    if any(kw in text for kw in ["한국 주식", "한국주식", "국내 추천", "국내추천", "한국 추천"]):
+        await cmd_kreport(update, ctx)
+        return
+
+    # 한국 섹터 트리거
+    for sector_key in KR_SECTOR_MAP:
+        if sector_key in text and any(kw in text for kw in ["관련주", "섹터", "종목", "어때", "한국"]):
+            ctx.args = [sector_key]
+            await cmd_krsector(update, ctx)
+            return
+
+    # 한국 종목명 트리거
+    for alias, sym in KR_ALIASES.items():
+        if alias in text and any(kw in text for kw in ["어때", "분석", "알려줘", "봐줘"]):
+            ctx.args = [sym]
+            await cmd_krcheck(update, ctx)
+            return
+
     # 레버리지 ETF 트리거
     if any(kw in text for kw in ["레버리지", "letf", "3배", "인버스", "레버", "leveraged"]):
         # bear/인버스 감지
@@ -1480,6 +1687,13 @@ def main():
     app.add_handler(CommandHandler("volume", cmd_volume))
     app.add_handler(CommandHandler("movers", cmd_movers))
     app.add_handler(CommandHandler("letf", cmd_letf))
+    # 한국 주식
+    app.add_handler(CommandHandler("kreport", cmd_kreport))
+    app.add_handler(CommandHandler("krtop3", cmd_krtop3))
+    app.add_handler(CommandHandler("krcheck", cmd_krcheck))
+    app.add_handler(CommandHandler("krsector", cmd_krsector))
+    app.add_handler(CommandHandler("krmarket", cmd_krmarket))
+    app.add_handler(CommandHandler("krcompare", cmd_krcompare))
     # 신규: 포지션 관리
     app.add_handler(CommandHandler("position", cmd_position))
     app.add_handler(CommandHandler("positions", cmd_positions))
