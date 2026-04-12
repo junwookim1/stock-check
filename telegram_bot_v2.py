@@ -56,6 +56,7 @@ from market_monitor import (
 )
 
 import finnhub_data
+from leveraged_etf import screen_letf, format_letf_report, get_letf_summary, LETF_UNIVERSE
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -431,6 +432,14 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "  /morning — 장 시작 전 체크리스트\n"
         "  /fear — 공포탐욕지수 (Fear & Greed)\n"
         "  /earnings — 이번 주 실적 발표 일정\n\n"
+        "━━ *레버리지 ETF* ━━━━━━\n"
+        "  /letf — Bull 3x ETF 추천 TOP 5\n"
+        "  /letf bear — Bear(인버스) ETF TOP 5\n"
+        "  /letf all — Bull+Bear 통합 TOP 5\n"
+        "  /letf 반도체 — 섹터별 ETF 분석\n"
+        "  /letf list — 전체 레버리지 ETF 현황\n"
+        "  가능 섹터: 나스닥·반도체·기술·빅테크·금융\n"
+        "  바이오·헬스케어·에너지·방산·소형주\n\n"
         "━━ *포지션 관리* ━━━━━━━\n"
         "  /position NVDA 130 — 보유 종목 등록 (매수가)\n"
         "  /positions — 보유 종목 현황 + 손익 + 손절/익절 신호\n"
@@ -460,6 +469,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         '  "주간 리포트" → /weekly\n'
         '  "거래량 급등" → /volume\n'
         '  "급등락 종목" → /movers\n'
+        '  "레버리지 etf" → /letf\n'
+        '  "인버스 etf" → /letf bear\n'
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -1031,6 +1042,62 @@ async def cmd_fear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
+async def cmd_letf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/letf [bull|bear|all] [섹터] [n] — 레버리지 ETF 추천
+
+    예시:
+      /letf           → Bull ETF Top 5
+      /letf bear      → Bear(인버스) ETF Top 5
+      /letf all       → Bull+Bear 통합 Top 5
+      /letf 반도체    → 반도체 ETF (Bull+Bear)
+      /letf list      → 전체 현황 요약
+    """
+    args = list(ctx.args or [])
+    mode = "bull"
+    sector = None
+    top_n = 5
+    show_list = False
+
+    for arg in args:
+        a = arg.lower()
+        if a in ("bear", "short", "inverse", "인버스", "역방향", "하락"):
+            mode = "bear"
+        elif a in ("all", "전체", "both"):
+            mode = "all"
+        elif a in ("list", "목록", "현황"):
+            show_list = True
+        elif a.isdigit():
+            top_n = min(int(a), 10)
+        else:
+            sector = a  # 섹터 키워드
+
+    if show_list:
+        await update.message.reply_text("⏳ 레버리지 ETF 현황 불러오는 중...")
+        report = get_letf_summary(sector)
+        await _send_long(update, report)
+        return
+
+    mode_label = {"bull": "Bull", "bear": "Bear(인버스)", "all": "전체"}[mode]
+    sector_label = f" [{sector}]" if sector else ""
+    await update.message.reply_text(
+        f"⏳ {mode_label}{sector_label} 레버리지 ETF 분석 중..."
+    )
+
+    try:
+        results = screen_letf(mode=mode, sector=sector, top_n=top_n)
+        if not results:
+            await update.message.reply_text(
+                f"📊 조건에 맞는 레버리지 ETF가 없습니다.\n"
+                f"가능한 섹터: 나스닥 · 반도체 · 기술 · 빅테크 · 금융 · 바이오 · 헬스케어 · 에너지 · 방산 · 소형주"
+            )
+            return
+        report = format_letf_report(results, mode=mode)
+        await _send_long(update, report)
+    except Exception as ex:
+        logger.error(f"cmd_letf failed: {ex}")
+        await update.message.reply_text(f"❌ 레버리지 ETF 분석 실패: {str(ex)[:200]}")
+
+
 async def cmd_position(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/position NVDA 130 — 보유 종목 등록 (종목 매수가)"""
     if len(ctx.args) < 2:
@@ -1248,6 +1315,16 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """명령어가 아닌 일반 텍스트 처리"""
     text = update.message.text.strip().lower()
 
+    # 레버리지 ETF 트리거
+    if any(kw in text for kw in ["레버리지", "letf", "3배", "인버스", "레버", "leveraged"]):
+        # bear/인버스 감지
+        if any(kw in text for kw in ["인버스", "bear", "하락 헤지", "역방향"]):
+            ctx.args = ["bear"]
+        else:
+            ctx.args = []
+        await cmd_letf(update, ctx)
+        return
+
     # 거래량 급등 트리거
     if any(kw in text for kw in ["거래량", "volume", "급등", "폭발", "터진"]):
         ctx.args = []
@@ -1402,6 +1479,7 @@ def main():
     app.add_handler(CommandHandler("fear", cmd_fear))
     app.add_handler(CommandHandler("volume", cmd_volume))
     app.add_handler(CommandHandler("movers", cmd_movers))
+    app.add_handler(CommandHandler("letf", cmd_letf))
     # 신규: 포지션 관리
     app.add_handler(CommandHandler("position", cmd_position))
     app.add_handler(CommandHandler("positions", cmd_positions))
